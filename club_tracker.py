@@ -38,6 +38,7 @@ MORPH_KERNEL_SIZE = 5
 MIN_CONTOUR_AREA = 250          # минимальная площадь контура булавы (в пикселях)
 MAX_CONTOUR_AREA_RATIO = 0.08   # максимальная доля площади кадра для контура
 MIN_DETECTION_CONFIDENCE = 0.35 # порог уверенности для ONNX-модели
+NMS_IOU_THRESHOLD = 0.45        # порог IoU для подавления дублирующихся боксов ONNX-модели
 
 
 @dataclass
@@ -102,6 +103,27 @@ def _contours_to_detections(mask: np.ndarray) -> List[ClubDetection]:
     return detections
 
 
+def _apply_nms(detections: List[ClubDetection], boxes: List[List[float]]) -> List[ClubDetection]:
+    """Подавление немаксимумов (NMS): убирает пересекающиеся боксы-дубли.
+
+    detections и boxes параллельны (boxes[i] — бокс detections[i] в формате
+    [x0, y0, x1, y1], нормализованные координаты). Возвращает подмножество
+    detections, отсортированное как исходный список.
+    """
+    if len(detections) <= 1:
+        return detections
+    scores = [det.confidence for det in detections]
+    indices = cv2.dnn.NMSBoxes(boxes, scores, MIN_DETECTION_CONFIDENCE, NMS_IOU_THRESHOLD)
+    if indices is None or len(indices) == 0:
+        # NMS не сработал (например, пустой ввод) — возвращаем как есть
+        return detections
+    # OpenCV может вернуть индексы как [[i], ...] или [i, ...] — нормализуем
+    flat = [int(item) for item in np.array(indices).flatten()]
+    # Сохраняем исходный порядок сортировки по x (список уже отсортирован по x)
+    keep = sorted(flat)
+    return [detections[i] for i in keep]
+
+
 class ClubTracker:
     """
     Трекер булав: детекция на каждом кадре + сопоставление детекций
@@ -131,23 +153,30 @@ class ClubTracker:
         return self._net is not None
 
     def _detect_with_model(self, frame_bgr: np.ndarray) -> List[ClubDetection]:
-        """Детекция булав кастомной ONNX-моделью (формат выхода YOLOv8)."""
+        """Детекция булав кастомной ONNX-моделью (формат выхода YOLOv8).
+
+        Выход сети имеет форму (4+num_classes, num_anchors) после снятия батч-оси
+        (или (1, 4+num_classes, num_anchors) — обрабатывается через squeeze).
+        Координаты боксов приходят в масштабе входа сети (640x640), поэтому
+        нормализуются на размер входа, а не исходного кадра.
+        """
         blob = cv2.dnn.blobFromImage(frame_bgr, 1 / 255.0, self._input_size, swapRB=True, crop=False)
         self._net.setInput(blob)
         outputs = self._net.forward()
 
         detections = []
-        # YOLOv8 output shape: [1, 4+num_classes, num_anchors]
-        out = outputs[0] if outputs.ndim == 3 else outputs
-        if out.ndim != 3:
-            return detections
-        out = np.squeeze(out)
-        if out.shape[0] < 5:
+        # Снимаем только батч-ось: (1, 4+nc, A) -> (4+nc, A).
+        # Внимание: np.squeeze здесь нельзя — он снял бы и ось якорей длины 1
+        # (5, 1) -> (5,), ломая парсинг одиночной детекции.
+        out = outputs[0] if outputs.ndim == 3 and outputs.shape[0] == 1 else outputs
+        if out.ndim != 2 or out.shape[0] < 5:
+            # Неожиданная форма выхода — детекций нет (fallback на HSV в detect())
             return detections
 
-        rows = out.shape[1]
-        frame_h, frame_w = frame_bgr.shape[:2]
-        for i in range(rows):
+        num_anchors = out.shape[1]
+        input_w, input_h = self._input_size
+        kept_boxes = []  # [x0, y0, x1, y1] в нормализованных координатах, параллельно detections
+        for i in range(num_anchors):
             row = out[:, i]
             scores = row[4:]
             class_id = int(np.argmax(scores))
@@ -155,21 +184,32 @@ class ClubTracker:
             if confidence < MIN_DETECTION_CONFIDENCE:
                 continue
             cx, cy, w, h = row[0], row[1], row[2], row[3]
-            # Проверяем, что бокс в пределах кадра
-            if cx < 0 or cy < 0 or w <= 0 or h <= 0:
+            # Координаты сети — в масштабе входа: нормализуем к 0..1
+            cx_n = cx / input_w
+            cy_n = cy / input_h
+            w_n = w / input_w
+            h_n = h / input_h
+            # Бокс целиком вне кадра (с учётом клампа) — пропускаем
+            if w_n <= 0 or h_n <= 0 or cx_n + w_n / 2 <= 0 or cy_n + h_n / 2 <= 0 \
+                    or cx_n - w_n / 2 >= 1 or cy_n - h_n / 2 >= 1:
                 continue
-            x0 = max(0, cx - w / 2)
-            y0 = max(0, cy - h / 2)
-            x1 = min(frame_w, cx + w / 2)
-            y1 = min(frame_h, cy + h / 2)
+            x0 = max(0.0, cx_n - w_n / 2)
+            y0 = max(0.0, cy_n - h_n / 2)
+            x1 = min(1.0, cx_n + w_n / 2)
+            y1 = min(1.0, cy_n + h_n / 2)
+            kept_boxes.append([x0, y0, x1, y1])
             detections.append(
                 ClubDetection(
-                    x=(x0 + x1) / 2 / frame_w,
-                    y=(y0 + y1) / 2 / frame_h,
-                    area=w * h,
+                    x=(x0 + x1) / 2,
+                    y=(y0 + y1) / 2,
+                    area=(x1 - x0) * (y1 - y0) * input_w * input_h,
                     confidence=confidence,
                 )
             )
+
+        # NMS: убираем дублирующиеся боксы на одну булаву (YOLOv8 без NMS
+        # отдаёт много пересекающихся детекций, что сбивает трекинг)
+        detections = _apply_nms(detections, kept_boxes)
 
         detections.sort(key=lambda d: d.x)
         return detections
