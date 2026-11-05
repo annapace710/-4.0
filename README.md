@@ -15,6 +15,9 @@
 - `src/app/config.py` — единая конфигурация: пути (`MODEL_PATH`, `CLUB_MODEL_PATH`,
   `UPLOAD_DIR`), лимиты загрузок, API-ключи и rate limit, CORS, настройки агента;
   значения берутся из переменных окружения с дефолтами
+- `src/app/schemas.py` — Pydantic-схемы запросов/ответов API (автодокументация в `/docs`)
+- `src/app/auth.py` — авторизация (API-ключи) и rate limiting `/upload` и `/agent/chat`
+  как FastAPI-зависимости (Depends)
 - `club_tracker.py` — трекинг булав (HSV-сегментация + опциональная ONNX-модель)
 - `storage.py` — хранение отчётов тренировок (JSON + видео + кадры, автоочистка через 7 дней)
 - `report_generator.py` — генерация PDF-карточки тренировки (reportlab)
