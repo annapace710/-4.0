@@ -7,18 +7,19 @@
 - uvicorn main:app (Dockerfile, docker-compose, локальный запуск);
 - test_main.py: 21 имя из списка `from main import (...)`;
 - test_agent.py: переключён на `import src.app.main as main` (патчи атрибутов
-  rate-limit/LLM должны попадать в модуль эндпоинтов);
+  rate-limit/LLM должны попадать в модуль эндпоинтов; с Шага 3 лимит агента
+  патчится в src.app.auth);
 - scripts/download_pose_model.py: MODEL_PATH, MODEL_SHA256_PATH, _file_sha256,
   verify_pose_model.
 
-Важно: эндпоинты читают get_llm_client и лимиты из модуля src.app.main,
+Важно: эндпоинты читают get_llm_client из модуля src.app.main,
 поэтому тесты патчат именно его; настоящие привязки в этом файле нужны
 scripts/download_pose_model.py и точкам входа uvicorn.
 """
 
+from src.app.auth import AGENT_RATE_LIMIT_PER_MINUTE  # noqa: F401  (Шаг 3: auth вынесен)
 from src.app.main import (  # noqa: F401
     AGENT_MAX_HISTORY_MESSAGES,
-    AGENT_RATE_LIMIT_PER_MINUTE,
     AthleteTrack,
     MAX_FILE_SIZE_BYTES,
     app,

@@ -4,7 +4,7 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
+from fastapi import Depends, FastAPI, File, Form, UploadFile, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, HTMLResponse
 import cv2  # OpenCV
@@ -12,6 +12,8 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
+
+from pydantic import ValidationError
 
 from club_tracker import ClubTracker, analyze_club_flight, assign_clubs_to_athletes
 import storage
@@ -23,21 +25,24 @@ from agent.llm_client import (
 )
 from agent.prompts import build_report_context
 
+from .auth import require_agent_access, require_api_key
 from .config import (
     AGENT_MAX_HISTORY_MESSAGES,
-    AGENT_RATE_LIMIT_PER_MINUTE,
     ALLOWED_EXTENSIONS,
     ALLOWED_ORIGINS,
     ALLOWED_ORIGIN_REGEX,
-    API_KEYS,
-    API_KEY_HEADER,
     CLUB_MODEL_PATH,
     MAX_FILE_SIZE_BYTES,
     MAX_FILE_SIZE_MB,
     MODEL_PATH,
     MODEL_SHA256_PATH,
     UPLOAD_DIR,
-    UPLOAD_RATE_LIMIT_PER_MINUTE,
+)
+from .schemas import (
+    AgentChatRequest,
+    AgentChatResponse,
+    AgentHealthResponse,
+    HealthResponse,
 )
 
 # Приложение создаётся с lifespan-контекстом: тяжёлые проверки (целостность
@@ -59,61 +64,9 @@ app = FastAPI(lifespan=lifespan)
 # Размер группы для группового формата (число гимнасток)
 GROUP_SIZE = 5
 
-# --- Авторизация и rate limiting на /upload (пункт 6 ревью) ---
-# Константы API_KEYS, API_KEY_HEADER и UPLOAD_RATE_LIMIT_PER_MINUTE импортируются
-# из config.py. Список валидных API-ключей задается переменной окружения API_KEYS
-# (ключи через запятую). Если переменная не задана или пуста — открытый доступ
-# (режим разработки/MVP). Для продакшена: задайте API_KEYS в окружении, клиенты
-# передают ключ в заголовке X-API-Key.
-# Rate limit хранится в памяти процесса (сбрасывается при рестарте) — для MVP достаточно.
-
-_rate_limit_lock = threading.Lock()
-_rate_limit_buckets: dict = {}  # client_id -> list[timestamp] последних запросов
-
-
-def _client_id(request: Request, api_key: str) -> str:
-    """Идентификатор клиента для rate limit: API-ключ или IP-адрес."""
-    return api_key or (request.client.host if request.client else "unknown")
-
-
-def _check_rate_limit(client_id: str) -> bool:
-    """
-    Скользящее окно 60 секунд: возвращает True, если запрос разрешен
-    (не превышен UPLOAD_RATE_LIMIT_PER_MINUTE).
-    """
-    now = time.monotonic()
-    with _rate_limit_lock:
-        bucket = _rate_limit_buckets.setdefault(client_id, [])
-        # Убираем записи старше 60 секунд
-        bucket[:] = [ts for ts in bucket if now - ts < 60.0]
-        if len(bucket) >= UPLOAD_RATE_LIMIT_PER_MINUTE:
-            return False
-        bucket.append(now)
-        return True
-
-
-def _require_api_key(request: Request) -> str:
-    """
-    Проверяет API-ключ (если авторизация настроена через API_KEYS).
-    Возвращает ключ клиента (или ""), если авторизация выключена.
-    Бросает HTTPException 401/429 при ошибке.
-    """
-    api_key = request.headers.get(API_KEY_HEADER, "")
-    if API_KEYS:
-        if api_key not in API_KEYS:
-            raise HTTPException(
-                status_code=401,
-                detail="Недействительный API-ключ. Передайте ключ в заголовке X-API-Key.",
-            )
-    if not _check_rate_limit(_client_id(request, api_key)):
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Превышен лимит загрузок: {UPLOAD_RATE_LIMIT_PER_MINUTE} в минуту. "
-                "Повторите попытку позже."
-            ),
-        )
-    return api_key
+# --- Авторизация и rate limiting на /upload и /agent/chat ---
+# Проверки вынесены в src/app/auth.py и подключаются как зависимости
+# (Depends). Константы (API_KEYS, лимиты) по-прежнему берутся из config.py.
 
 
 # --- Ленивый singleton PoseLandmarker (пункт 5 ревью) ---
@@ -1988,6 +1941,7 @@ def upload_video(
     video_file: UploadFile = File(...),
     exercise: str = Form("unknown"),
     format_type: str = Form("individual"),
+    _api_key: str = Depends(require_api_key),
 ):
     """
     Загрузка видео и синхронный анализ.
@@ -1995,9 +1949,6 @@ def upload_video(
     Обычный def (не async): FastAPI выполняет эндпоинт в threadpool, поэтому
     CPU-интенсивный analyze_video не блокирует event loop и конкурентные запросы.
     """
-    # 0. Авторизация и rate limiting (если настроены API_KEYS)
-    _require_api_key(request)
-
     filename = video_file.filename or "video.mp4"
 
     # 1. Валидация файла (fast-path по Content-Length). Ошибка клиента ->
@@ -2224,7 +2175,7 @@ async def video_player(report_id: str, t: float = 0.0):
     return HTMLResponse(html)
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health():
     """
     Health-check для деплой-проверок и мониторинга: статус сервиса
@@ -2238,28 +2189,16 @@ async def health():
 
 # --- LLM-агент-ассистент тренера (MVP: GigaChat, бесплатный тариф) ---
 
-# Константы AGENT_RATE_LIMIT_PER_MINUTE и AGENT_MAX_HISTORY_MESSAGES импортируются
-# из config.py. Rate limit на агент жёстче, чем на /upload, потому что
-# бесплатный тариф GigaChat имеет лимиты запросов. Тесты патчат атрибуты
-# именно модуля src.app.main — поэтому лимиты читаются через импортированные имена.
+# Лимит AGENT_RATE_LIMIT_PER_MINUTE живёт в src/app/auth.py и читается там же
+# (патчить в тестах нужно src.app.auth). AGENT_MAX_HISTORY_MESSAGES остаётся
+# импортом из config.py — им пользуется логика диалога ниже.
 
 
-def _check_agent_rate_limit(client_id: str) -> bool:
-    """Скользящее окно 60 с для эндпоинта агента (AGENT_RATE_LIMIT_PER_MINUTE)."""
-    now = time.monotonic()
-    with _rate_limit_lock:
-        bucket = _rate_limit_buckets.setdefault(f"agent:{client_id}", [])
-        bucket[:] = [ts for ts in bucket if now - ts < 60.0]
-        if len(bucket) >= AGENT_RATE_LIMIT_PER_MINUTE:
-            return False
-        bucket.append(now)
-        return True
-
-
-@app.post("/agent/chat/{report_id}")
+@app.post("/agent/chat/{report_id}", response_model=AgentChatResponse)
 async def agent_chat(
     report_id: str,
     request: Request,
+    _api_key: str = Depends(require_agent_access),
 ):
     """
     Чат с LLM-агентом по отчёту о тренировке.
@@ -2268,32 +2207,32 @@ async def agent_chat(
       {"message": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}
 
     Ответ: {"reply": "..."}.
-    Ошибки: 401/429 — auth/лимит; 404 — отчёт не найден; 400 — пустое сообщение;
-    503 — LLM не настроен; 502 — ошибка провайдера LLM.
+    Ошибки: 401/429 — auth/лимит; 404 — отчёт не найден; 400 — пустое сообщение
+    или некорректное тело; 503 — LLM не настроен; 502 — ошибка провайдера LLM.
     """
-    # 0. Auth + отдельный rate limit для агента
-    api_key = _require_api_key(request)
-    if not _check_agent_rate_limit(_client_id(request, api_key)):
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Превышен лимит сообщений: {AGENT_RATE_LIMIT_PER_MINUTE} в минуту. "
-                "Повторите попытку позже."
-            ),
-        )
-
-    # 1. Тело запроса
+    # 1. Тело запроса. Валидация вручную через model_validate (а не параметром
+    # эндпоинта), чтобы на некорректное тело отвечать 400, как и раньше —
+    # стандартная FastAPI-валидация вернула бы 422.
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса")
 
-    message = (body or {}).get("message") or ""
-    history = (body or {}).get("history") or []
-    if not isinstance(message, str) or not message.strip():
-        raise HTTPException(status_code=400, detail="Поле message обязательно и не может быть пустым")
-    if not isinstance(history, list):
-        raise HTTPException(status_code=400, detail="Поле history должно быть списком")
+    try:
+        payload = AgentChatRequest.model_validate(body)
+    except ValidationError:
+        raise HTTPException(status_code=400, detail="Некорректное тело запроса")
+
+    message = payload.message
+    history = payload.history or []
+
+    # Пустое (из одних пробелов) сообщение — прежняя ошибка 400;
+    # Pydantic-схема сама это не отсеивает.
+    if not message.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Поле message обязательно и не может быть пустым",
+        )
 
     # 2. LLM должен быть настроен до обращения к хранилищу (fail fast)
     try:
@@ -2324,10 +2263,8 @@ async def agent_chat(
     ]
     # История: только последние AGENT_MAX_HISTORY_MESSAGES сообщений
     for h in history[-AGENT_MAX_HISTORY_MESSAGES:]:
-        role = h.get("role")
-        content = h.get("content")
-        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
-            messages.append({"role": role, "content": content.strip()})
+        if h.content.strip():
+            messages.append({"role": h.role, "content": h.content.strip()})
 
     # 5. Запрос к LLM (цикл function calling внутри ask(): модель может
     #    запросить инструменты динамики — error_trend / previous_report)
@@ -2339,7 +2276,7 @@ async def agent_chat(
     return {"reply": reply, "report_id": report_id}
 
 
-@app.get("/agent/health")
+@app.get("/agent/health", response_model=AgentHealthResponse)
 async def agent_health():
     """Доступность LLM-агента: настроен ли провайдер и установлен ли SDK."""
     from agent.llm_client import is_llm_configured

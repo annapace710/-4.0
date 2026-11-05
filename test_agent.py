@@ -130,14 +130,18 @@ class TestAgentChat(AgentTestCase):
 
     def test_rate_limit(self):
         rid = self._save_report()
-        main.AGENT_RATE_LIMIT_PER_MINUTE = 2
+        # Лимит агента теперь живёт в модуле auth (Шаг 3) — патчим его
+        import src.app.auth as auth
+
+        original = auth.AGENT_RATE_LIMIT_PER_MINUTE
+        auth.AGENT_RATE_LIMIT_PER_MINUTE = 2
         try:
             self.client.post(f"/agent/chat/{rid}", json={"message": "1"})
             self.client.post(f"/agent/chat/{rid}", json={"message": "2"})
             resp = self.client.post(f"/agent/chat/{rid}", json={"message": "3"})
             self.assertEqual(resp.status_code, 429)
         finally:
-            main.AGENT_RATE_LIMIT_PER_MINUTE = 10
+            auth.AGENT_RATE_LIMIT_PER_MINUTE = original
 
     def test_llm_not_configured_raises(self):
         # Оригинальная фабрика без ключа в окружении должна бросать LLMNotConfiguredError
