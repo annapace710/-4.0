@@ -25,6 +25,7 @@ COPY --from=builder /install /usr/local
 
 # Код приложения (кроме данных пользователей и временных файлов)
 COPY main.py storage.py club_tracker.py report_generator.py ./
+COPY src/ ./src/
 COPY agent/ ./agent/
 COPY scripts/ ./scripts/
 COPY index.html live.html script.js style.css ./
