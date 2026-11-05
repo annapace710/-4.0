@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi.testclient import TestClient
 
-import main
+import src.app.main as main
 import storage
 from agent.llm_client import (
     BaseLLMClient,
