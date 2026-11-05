@@ -694,6 +694,133 @@ class TestClubTracker(unittest.TestCase):
         self.assertIsNotNone(trajectories[0].peak_y)
 
 
+class _FakeNet:
+    """Заглушка cv2.dnn.Net: setInput/forward как у настоящей сети ONNX."""
+
+    def __init__(self, output: np.ndarray):
+        self._output = output
+
+    def setInput(self, blob):
+        self.blob = blob
+
+    def forward(self):
+        return self._output
+
+
+class TestClubTrackerOnnxModel(unittest.TestCase):
+    """Тесты ONNX-ветки детекции булав (парсинг выхода YOLOv8, нормализация, NMS)."""
+
+    def _make_tracker(self, output: np.ndarray) -> ClubTracker:
+        """ClubTracker с подменённой сетью-заглушкой (реальный ONNX не нужен)."""
+        tracker = ClubTracker()
+        tracker._net = _FakeNet(output)
+        return tracker
+
+    def test_parses_batch_output_3d(self):
+        """Выход (1, 5, A) — батч-ось снимается, детекции парсятся."""
+        # Один якорь: cx=320, cy=320, w=64, h=128, score=0.9 (масштаб входа 640)
+        out = np.zeros((1, 5, 2), dtype=np.float32)
+        out[0, 0:4, 0] = [320.0, 320.0, 64.0, 128.0]
+        out[0, 4, 0] = 0.9
+        tracker = self._make_tracker(out)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].x, 0.5, delta=0.001)
+        self.assertAlmostEqual(dets[0].y, 0.5, delta=0.001)
+        self.assertAlmostEqual(dets[0].confidence, 0.9, delta=0.001)
+
+    def test_parses_flat_output_2d(self):
+        """Выход уже без батч-оси (5, A) — тоже парсится."""
+        out = np.zeros((5, 2), dtype=np.float32)
+        out[0:4, 0] = [320.0, 320.0, 64.0, 128.0]
+        out[4, 0] = 0.8
+        tracker = self._make_tracker(out)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].x, 0.5, delta=0.001)
+
+    def test_normalization_by_input_size(self):
+        """Координаты делятся на размер входа (640), а не на размер кадра.
+
+        Регрессионный тест: раньше делили на frame_w/frame_h — при кадре 1920px
+        координаты занижались втрое.
+        """
+        # Якорь с центром (160, 160) в масштабе 640 => нормализованный центр 0.25
+        out = np.zeros((5, 1), dtype=np.float32)
+        out[0:4, 0] = [160.0, 160.0, 32.0, 32.0]
+        out[4, 0] = 0.9
+        tracker = self._make_tracker(out)
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)  # кадр шире входа сети
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].x, 0.25, delta=0.001)
+        self.assertAlmostEqual(dets[0].y, 0.25, delta=0.001)
+
+    def test_low_confidence_filtered(self):
+        """Якоря с уверенностью ниже порога отфильтровываются."""
+        out = np.zeros((5, 2), dtype=np.float32)
+        out[0:4, 0] = [320.0, 320.0, 64.0, 64.0]
+        out[4, 0] = 0.2  # ниже MIN_DETECTION_CONFIDENCE (0.35)
+        out[0:4, 1] = [320.0, 320.0, 64.0, 64.0]
+        out[4, 1] = 0.9
+        tracker = self._make_tracker(out)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].confidence, 0.9, delta=0.001)
+
+    def test_nms_merges_overlapping_boxes(self):
+        """Два сильно пересекающихся бокса → остаётся один (с макс. уверенностью)."""
+        out = np.zeros((5, 2), dtype=np.float32)
+        # Два почти одинаковых бокса в одном месте
+        out[0:4, 0] = [320.0, 320.0, 64.0, 64.0]
+        out[4, 0] = 0.95
+        out[0:4, 1] = [322.0, 322.0, 64.0, 64.0]
+        out[4, 1] = 0.80
+        tracker = self._make_tracker(out)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].confidence, 0.95, delta=0.001)
+
+    def test_nms_keeps_non_overlapping(self):
+        """Два разных бокса далеко друг от друга → остаются оба."""
+        out = np.zeros((5, 2), dtype=np.float32)
+        out[0:4, 0] = [160.0, 320.0, 64.0, 64.0]
+        out[4, 0] = 0.9
+        out[0:4, 1] = [480.0, 320.0, 64.0, 64.0]
+        out[4, 1] = 0.8
+        tracker = self._make_tracker(out)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        dets = tracker._detect_with_model(frame)
+        self.assertEqual(len(dets), 2)
+
+    def test_unexpected_output_shape_returns_empty(self):
+        """Неожиданная форма выхода (1D или узкая) → пустой список (fallback на HSV)."""
+        tracker = self._make_tracker(np.zeros((10,), dtype=np.float32))
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.assertEqual(tracker._detect_with_model(frame), [])
+
+        out = np.zeros((3, 4), dtype=np.float32)  # shape[0] < 5
+        tracker2 = self._make_tracker(out)
+        self.assertEqual(tracker2._detect_with_model(frame), [])
+
+    def test_detect_uses_model_before_hsv(self):
+        """detect() сначала пробует модель; HSV-fallback только при пустом результате."""
+        out = np.zeros((5, 1), dtype=np.float32)
+        out[0:4, 0] = [320.0, 320.0, 64.0, 64.0]
+        out[4, 0] = 0.9
+        tracker = self._make_tracker(out)
+        # Кадр с жёлтым кругом: HSV нашёл бы его, но модель должна выиграть
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.circle(frame, (100, 100), 12, (0, 255, 255), -1)
+        dets = tracker.detect(frame)
+        self.assertEqual(len(dets), 1)
+        self.assertAlmostEqual(dets[0].x, 0.5, delta=0.001)  # от модели, не HSV (0.156)
+
+
 class TestAthleteTracking(unittest.TestCase):
     """Тесты для трекинга гимнасток и связывания булав."""
 
