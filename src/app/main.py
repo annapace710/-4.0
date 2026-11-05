@@ -2,6 +2,8 @@ import os
 import time
 import threading
 import uuid
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, File, Form, UploadFile, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, HTMLResponse
@@ -21,23 +23,49 @@ from agent.llm_client import (
 )
 from agent.prompts import build_report_context
 
-app = FastAPI()
+from .config import (
+    AGENT_MAX_HISTORY_MESSAGES,
+    AGENT_RATE_LIMIT_PER_MINUTE,
+    ALLOWED_EXTENSIONS,
+    ALLOWED_ORIGINS,
+    ALLOWED_ORIGIN_REGEX,
+    API_KEYS,
+    API_KEY_HEADER,
+    CLUB_MODEL_PATH,
+    MAX_FILE_SIZE_BYTES,
+    MAX_FILE_SIZE_MB,
+    MODEL_PATH,
+    MODEL_SHA256_PATH,
+    UPLOAD_DIR,
+    UPLOAD_RATE_LIMIT_PER_MINUTE,
+)
+
+# Приложение создаётся с lifespan-контекстом: тяжёлые проверки (целостность
+# модели PoseLandmarker) выполняются при старте сервиса, а не на уровне
+# модуля (side effect на import мешал тестам и воркерам).
+POSE_MODEL_OK = True  # консервативное значение до первого запуска lifespan
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Проверяет целостность модели PoseLandmarker при старте приложения."""
+    global POSE_MODEL_OK
+    POSE_MODEL_OK = verify_pose_model()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Размер группы для группового формата (число гимнасток)
 GROUP_SIZE = 5
 
 # --- Авторизация и rate limiting на /upload (пункт 6 ревью) ---
-# Список валидных API-ключей задается переменной окружения API_KEYS (ключи через запятую).
-# Если переменная не задана или пуста — открытый доступ (режим разработки/MVP).
-# Для продакшена: задайте API_KEYS в окружении, клиенты передают ключ в заголовке X-API-Key.
-API_KEYS = [
-    k.strip() for k in os.environ.get("API_KEYS", "").split(",") if k.strip()
-]
-API_KEY_HEADER = "X-API-Key"
-
-# Rate limit на /upload: сколько загрузок в минуту разрешено на один ключ/IP.
-# Счетчики хранятся в памяти процесса (сбрасываются при рестарте) — для MVP достаточно.
-UPLOAD_RATE_LIMIT_PER_MINUTE = int(os.environ.get("UPLOAD_RATE_LIMIT_PER_MINUTE", "5"))
+# Константы API_KEYS, API_KEY_HEADER и UPLOAD_RATE_LIMIT_PER_MINUTE импортируются
+# из config.py. Список валидных API-ключей задается переменной окружения API_KEYS
+# (ключи через запятую). Если переменная не задана или пуста — открытый доступ
+# (режим разработки/MVP). Для продакшена: задайте API_KEYS в окружении, клиенты
+# передают ключ в заголовке X-API-Key.
+# Rate limit хранится в памяти процесса (сбрасывается при рестарте) — для MVP достаточно.
 
 _rate_limit_lock = threading.Lock()
 _rate_limit_buckets: dict = {}  # client_id -> list[timestamp] последних запросов
@@ -120,42 +148,26 @@ def get_pose_landmarker():
 
 
 # CORS: разрешаем обращения с фронтенда (SourceCraft Sites), локальной разработки
-# и туннелей Google Colab (Cloudflare/ngrok)
+# и туннелей Google Colab (Cloudflare/ngrok). Значения импортируются из config.py.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://annapace.sourcecraft.site",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    ],
-    allow_origin_regex=r"https?://(.*\.trycloudflare\.com|.*\.ngrok-free\.app|.*\.ngrok\.io)$",
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Корень проекта (src/app/main.py лежит на два уровня глубже корня).
-# Пути к модели, ONNX-модели булав и директориям данных якорятся к корню,
-# чтобы физическое расположение этих файлов не менялось при переносе кода.
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Директория для временного хранения загруженных видео
-UPLOAD_DIR = os.path.join(_PROJECT_ROOT, "uploads", "temp")
-ALLOWED_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov", ".mkv", ".m4v", ".hevc", ".h264", ".h265"}
-MAX_FILE_SIZE_MB = 50
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-
-# Гарантируем существование директории для загрузок
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Пути (MODEL_PATH, MODEL_SHA256_PATH, CLUB_MODEL_PATH, UPLOAD_DIR), лимиты
+# загрузок (MAX_FILE_SIZE_MB/BYTES, ALLOWED_EXTENSIONS) и корень проекта
+# (_PROJECT_ROOT) импортируются из config.py.
 
 # --- MediaPipe Tasks API (новый API, совместим с Python 3.13) ---
 # Модель pose_landmarker_lite.task должна лежать в корне проекта.
 # Скачивание при импорте убрано (side effect на import + race condition воркеров):
 # модель ставится скриптом scripts/download_pose_model.py, который записывает
-# pin-файл pose_landmarker_lite.sha256; при старте приложения целостность
-# файла проверяется по этому pin-хешу.
-MODEL_PATH = os.path.join(_PROJECT_ROOT, "pose_landmarker_lite.task")
-MODEL_SHA256_PATH = MODEL_PATH + ".sha256"
+# pin-файл pose_landmarker_lite.sha256; при старте приложения (lifespan)
+# целостность файла проверяется по этому pin-хешу.
 
 
 def _file_sha256(path: str) -> str:
@@ -199,12 +211,6 @@ def verify_pose_model() -> bool:
         return False
     return True
 
-
-POSE_MODEL_OK = verify_pose_model()
-
-# Кастомная ONNX-модель детекции булав (обучается через train_club_detector.py).
-# Если файл отсутствует — используется HSV-сегментация (club_tracker.py).
-CLUB_MODEL_PATH = os.path.join(_PROJECT_ROOT, "club_detector.onnx")
 
 # Индексы ключевых точек MediaPipe Pose (33 точки)
 LANDMARK_LEFT_SHOULDER = 11
@@ -2232,11 +2238,10 @@ async def health():
 
 # --- LLM-агент-ассистент тренера (MVP: GigaChat, бесплатный тариф) ---
 
-# Rate limit на агент: сообщения в минуту на клиента (жёстче, чем /upload,
-# потому что бесплатный тариф GigaChat имеет лимиты запросов).
-AGENT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("AGENT_RATE_LIMIT_PER_MINUTE", "10"))
-# Максимум сообщений истории диалога, отправляемых в LLM (ограничение стоимости)
-AGENT_MAX_HISTORY_MESSAGES = 12
+# Константы AGENT_RATE_LIMIT_PER_MINUTE и AGENT_MAX_HISTORY_MESSAGES импортируются
+# из config.py. Rate limit на агент жёстче, чем на /upload, потому что
+# бесплатный тариф GigaChat имеет лимиты запросов. Тесты патчат атрибуты
+# именно модуля src.app.main — поэтому лимиты читаются через импортированные имена.
 
 
 def _check_agent_rate_limit(client_id: str) -> bool:
