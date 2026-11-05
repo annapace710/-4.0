@@ -118,7 +118,7 @@ def _apply_nms(detections: List[ClubDetection], boxes: List[List[float]]) -> Lis
         # NMS не сработал (например, пустой ввод) — возвращаем как есть
         return detections
     # OpenCV может вернуть индексы как [[i], ...] или [i, ...] — нормализуем
-    flat = [int(idx) for item in np.array(indices).flatten()]
+    flat = [int(item) for item in np.array(indices).flatten()]
     # Сохраняем исходный порядок сортировки по x (список уже отсортирован по x)
     keep = sorted(flat)
     return [detections[i] for i in keep]
@@ -165,8 +165,10 @@ class ClubTracker:
         outputs = self._net.forward()
 
         detections = []
-        # Снимаем батч-ось: (1, 4+nc, A) -> (4+nc, A); 2D уже норма для батча 1
-        out = np.squeeze(outputs)
+        # Снимаем только батч-ось: (1, 4+nc, A) -> (4+nc, A).
+        # Внимание: np.squeeze здесь нельзя — он снял бы и ось якорей длины 1
+        # (5, 1) -> (5,), ломая парсинг одиночной детекции.
+        out = outputs[0] if outputs.ndim == 3 and outputs.shape[0] == 1 else outputs
         if out.ndim != 2 or out.shape[0] < 5:
             # Неожиданная форма выхода — детекций нет (fallback на HSV в detect())
             return detections
