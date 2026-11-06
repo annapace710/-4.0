@@ -18,23 +18,27 @@
 - `src/app/schemas.py` — Pydantic-схемы запросов/ответов API (автодокументация в `/docs`)
 - `src/app/auth.py` — авторизация (API-ключи) и rate limiting `/upload` и `/agent/chat`
   как FastAPI-зависимости (Depends)
-- `club_tracker.py` — трекинг булав (HSV-сегментация + опциональная ONNX-модель)
-- `storage.py` — хранение отчётов тренировок (JSON + видео + кадры, автоочистка через 7 дней)
-- `report_generator.py` — генерация PDF-карточки тренировки (reportlab)
+- `src/app/club_tracker.py` — трекинг булав (HSV-сегментация + опциональная ONNX-модель)
+- `src/app/storage.py` — хранение отчётов тренировок (JSON + видео + кадры,
+  автоочистка через 7 дней); `REPORTS_DIR` якорится к корню проекта
+- `src/app/report_generator.py` — генерация PDF-карточки тренировки (reportlab)
+- `src/app/agent/` — модуль LLM-ассистента тренера:
+  - `src/app/agent/llm_client.py` — клиент LLM (GigaChat, бесплатный тариф) с циклом
+    function calling; абстракция `BaseLLMClient` позволяет сменить провайдера
+    через переменную окружения `LLM_PROVIDER` без переписывания
+  - `src/app/agent/prompts.py` — системный промпт методиста и сборка контекста отчёта
+    (детерминированные метрики: ошибки, оценка, тренд прогресса)
+  - `src/app/agent/tools.py` — инструменты агента (`get_error_trend`, `get_previous_report`)
+    поверх хранилища отчётов
+- `storage.py`, `club_tracker.py`, `report_generator.py`, `agent/` — обёртки-реэкспорты
+  в корне (Шаг 5 рефакторинга): сохраняют совместимость старых импортов
+  (`import storage`, `from agent...`), сам код лежит в `src/app/`
 - `train_club_detector.py` — обучение собственной модели детекции булав (YOLOv8)
 - `tests/` — тесты (unittest):
   - `tests/test_main.py` — тесты бэкенда
   - `tests/test_agent.py` — тесты LLM-ассистента (мок-LLM, без сетевых вызовов)
   - `tests/setup_paths.py` — добавляет корень проекта в `sys.path`
     (импортируется тестовыми файлами первой строкой)
-- `agent/` — модуль LLM-ассистента тренера:
-  - `agent/llm_client.py` — клиент LLM (GigaChat, бесплатный тариф) с циклом
-    function calling; абстракция `BaseLLMClient` позволяет сменить провайдера
-    через переменную окружения `LLM_PROVIDER` без переписывания
-  - `agent/prompts.py` — системный промпт методиста и сборка контекста отчёта
-    (детерминированные метрики: ошибки, оценка, тренд прогресса)
-  - `agent/tools.py` — инструменты агента (`get_error_trend`, `get_previous_report`)
-    поверх хранилища отчётов
 - `requirements.txt` — зависимости Python
 - `requirements-train.txt` — зависимости для обучения модели
 - `Dockerfile`, `docker-compose.yml` — контейнеризация: воспроизводимое окружение
