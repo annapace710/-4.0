@@ -23,5 +23,5 @@ workflows:
               - pip install -r requirements.txt
               # Модель PoseLandmarker: скачивание с фиксацией и проверкой SHA-256 (supply-chain pin)
               - python scripts/download_pose_model.py
-              # Тесты: до слияния Шага 4 — в корне, после — в tests/ (unittest discover)
-              - python -m unittest discover -s . -p "test_*.py" -v || python -m unittest discover -s tests -p "test_*.py" -v
+              # Тесты лежат в tests/ (unittest discover)
+              - python -m unittest discover -s tests -p "test_*.py" -v
