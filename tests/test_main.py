@@ -1,14 +1,13 @@
 import os
-import sys
 import unittest
 
 import cv2
 import numpy as np
 
-import storage
+# Корень проекта в sys.path до импортов main/storage/club_tracker
+import setup_paths  # noqa: F401
 
-# Добавляем корень проекта в путь, чтобы импортировать main
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import storage
 
 from main import (
     validate_video_file,

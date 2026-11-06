@@ -5,7 +5,7 @@
 Этот модуль реэкспортирует всё, на что ссылаются внешние точки входа:
 
 - uvicorn main:app (Dockerfile, docker-compose, локальный запуск);
-- test_main.py: 21 имя из списка `from main import (...)`;
+- test_main.py: 21 имя из списка `from main import (...)` (тесты лежат в `tests/`);
 - test_agent.py: переключён на `import src.app.main as main` (патчи атрибутов
   rate-limit/LLM должны попадать в модуль эндпоинтов; с Шага 3 лимит агента
   патчится в src.app.auth);

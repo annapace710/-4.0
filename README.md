@@ -22,8 +22,11 @@
 - `storage.py` — хранение отчётов тренировок (JSON + видео + кадры, автоочистка через 7 дней)
 - `report_generator.py` — генерация PDF-карточки тренировки (reportlab)
 - `train_club_detector.py` — обучение собственной модели детекции булав (YOLOv8)
-- `test_main.py` — тесты (unittest) для бэкенда
-- `test_agent.py` — тесты (unittest) для LLM-ассистента (мок-LLM, без сетевых вызовов)
+- `tests/` — тесты (unittest):
+  - `tests/test_main.py` — тесты бэкенда
+  - `tests/test_agent.py` — тесты LLM-ассистента (мок-LLM, без сетевых вызовов)
+  - `tests/setup_paths.py` — добавляет корень проекта в `sys.path`
+    (импортируется тестовыми файлами первой строкой)
 - `agent/` — модуль LLM-ассистента тренера:
   - `agent/llm_client.py` — клиент LLM (GigaChat, бесплатный тариф) с циклом
     function calling; абстракция `BaseLLMClient` позволяет сменить провайдера

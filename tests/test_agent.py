@@ -4,10 +4,10 @@
 
 import json
 import os
-import sys
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта в sys.path до импортов src.app.main/storage/agent
+import setup_paths  # noqa: F401
 
 from fastapi.testclient import TestClient
 
