@@ -6,24 +6,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, UploadFile, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, HTMLResponse
 import cv2  # OpenCV
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
 
-from pydantic import ValidationError
-
 from club_tracker import ClubTracker, analyze_club_flight, assign_clubs_to_athletes
 import storage
-import report_generator
-from agent.llm_client import (
-    LLMNotConfiguredError,
-    LLMRequestError,
-    get_llm_client,
-)
-from agent.prompts import build_report_context
+# get_llm_client остаётся в пространстве имён main (Шаг 6в): тесты патчат
+# main.get_llm_client, а агент-роутер (src/app/agent/router.py) резолвит
+# фабрику лениво через этот модуль в момент запроса.
+from agent.llm_client import get_llm_client  # noqa: F401
 
 from .analysis.athlete_tracking import (
     GROUP_SIZE,
@@ -96,16 +90,15 @@ from .config import (
     MODEL_SHA256_PATH,
     UPLOAD_DIR,
 )
-from .schemas import (
-    AgentChatRequest,
-    AgentChatResponse,
-    AgentHealthResponse,
-    HealthResponse,
-)
+from .schemas import HealthResponse
+from .agent.router import router as agent_router
+from .reports.router import router as reports_router
 
 # Шаг 6а рефакторинга: чистые функции анализа вынесены в домен src/app/analysis/
 # (metrics, athlete_tracking, feedback_rules, team_feedback), проверка модели —
-# в src/app/lifespan.py. Этот модуль реэкспортирует прежние имена (см. импорты
+# в src/app/lifespan.py. Шаг 6в: роуты отчётов и LLM-агента вынесены в домены
+# src/app/reports/router.py и src/app/agent/router.py и подключаются через
+# include_router ниже. Этот модуль реэкспортирует прежние имена (см. импорты
 # выше), поэтому `from main import ...` в тестах и скриптах работает как раньше.
 
 # Приложение создаётся с lifespan-контекстом: тяжёлые проверки (целостность
@@ -170,6 +163,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Домены отчётов и LLM-агента (Шаг 6в): роуты перенесены в
+# src/app/reports/router.py и src/app/agent/router.py без изменения логики.
+app.include_router(reports_router)
+app.include_router(agent_router)
 
 # Пути (MODEL_PATH, MODEL_SHA256_PATH, CLUB_MODEL_PATH, UPLOAD_DIR), лимиты
 # загрузок (MAX_FILE_SIZE_MB/BYTES, ALLOWED_EXTENSIONS) и корень проекта
@@ -499,7 +497,7 @@ def analyze_video(video_path: str, exercise: str = "unknown", format_type: str =
             clubs_per_athlete_for_team = clubs.get("athletes")
         team_feedback = detect_team_feedback(target_tracks, fps, clubs_per_athlete_for_team)
 
-    # Детекция ошибок для первой гимнастки (для обратной совмест��мости ответа)
+    # Детекция ошибок для первой гимнастки (для обратной совместимости ответа)
     first_movement = athlete_results[0]["movement"] if athlete_results else {}
     if isinstance(clubs, dict) and clubs.get("format") == "group":
         feedback = detect_errors_and_recommendations(exercise, first_movement, None)
@@ -675,11 +673,6 @@ def upload_video(
             os.remove(save_path)
 
 
-def _get_report_or_none(report_id: str):
-    """Загружает отчёт или возвращает None (для FastAPI 404)."""
-    return storage.get_report(report_id)
-
-
 @app.get("/stats/{exercise}")
 async def get_stats(exercise: str, format_type: str = "individual", k: int = 3):
     """
@@ -700,131 +693,6 @@ async def get_stats(exercise: str, format_type: str = "individual", k: int = 3):
     }
 
 
-@app.get("/reports/{report_id}/pdf")
-async def get_report_pdf(report_id: str):
-    """Возвращает PDF-карточку тренировки («Сохранить отчёт»)."""
-    doc = _get_report_or_none(report_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Отчёт не найден")
-
-    analysis = doc.get("analysis") or {}
-    report_dir = storage.get_report_dir(report_id)
-    frames_dir = os.path.join(report_dir, "frames")
-
-    # Миниатюра видео: первый кадр, сохранённый во время анализа
-    thumb_path = os.path.join(frames_dir, "thumb.png")
-    if not os.path.exists(thumb_path):
-        video_full_path = os.path.join(report_dir, doc.get("video_file") or "")
-        _save_video_thumbnail(video_full_path, thumb_path)
-
-    # Кадры ошибок (PNG + координаты скелета для обводки)
-    saved_frames = analysis.get("error_frames") or {}
-    error_frames = {}
-    for key, f in saved_frames.items():
-        png_path = os.path.join(frames_dir, f"error_{key}.png")
-        if os.path.exists(png_path):
-            error_frames[int(key)] = {
-                "path": png_path,
-                "timestamp": f.get("timestamp"),
-                "landmarks": f.get("landmarks"),
-            }
-
-    # Предыдущий отчёт по тому же упражнению и формату — для блока динамики
-    previous = storage.find_previous_report(
-        doc.get("exercise"), doc.get("format"), doc.get("created_at") or ""
-    )
-
-    pdf_path = os.path.join(report_dir, "report.pdf")
-    report_generator.build_report_pdf(
-        doc,
-        video_thumb_path=thumb_path if os.path.exists(thumb_path) else None,
-        error_frames=error_frames,
-        previous_meta=previous,
-        output_path=pdf_path,
-    )
-
-    if not os.path.exists(pdf_path):
-        return {"error": "Не удалось сформировать PDF"}
-
-    return FileResponse(
-        pdf_path,
-        media_type="application/pdf",
-        filename=f"training-report-{report_id[:8]}.pdf",
-    )
-
-
-def _save_video_thumbnail(video_path: str, thumb_path: str) -> None:
-    """Сохраняет первый кадр видео как PNG-миниатюру (кэшируется на диске)."""
-    if os.path.exists(thumb_path) or not video_path or not os.path.exists(video_path):
-        return
-    cap = cv2.VideoCapture(video_path)
-    try:
-        ret, frame = cap.read()
-        if ret:
-            os.makedirs(os.path.dirname(thumb_path), exist_ok=True)
-            cv2.imwrite(thumb_path, frame)
-    finally:
-        cap.release()
-
-
-@app.get("/reports/{report_id}/video")
-async def get_report_video(report_id: str, request: Request, t: float = None):
-    """
-    Раздаёт видео отчёта. Параметр t (секунды) используется фронтенд-плеером
-    для перескока к моменту ошибки по кликабельным таймкодам из PDF.
-    """
-    doc = _get_report_or_none(report_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="Отчёт не найден")
-    video_path = os.path.join(storage.get_report_dir(report_id), doc.get("video_file") or "")
-    if not os.path.exists(video_path):
-        raise HTTPException(status_code=404, detail="Видео отчёта не найдено")
-    return FileResponse(
-        video_path,
-        media_type="video/mp4",
-        filename=os.path.basename(video_path),
-    )
-
-
-@app.get("/reports/{report_id}/frames/{frame_name}")
-async def get_report_frame(report_id: str, frame_name: str):
-    """Раздаёт PNG-кадры отчёта (скриншоты ошибок, тепловая карта)."""
-    if not storage.is_valid_report_id(report_id):
-        return {"error": "Некорректный report_id"}
-    # Имя файла строго ограничено (защита от path traversal)
-    allowed = {"error_0.png", "error_1.png", "error_2.png", "error_3.png", "error_4.png", "heatmap.png", "thumb.png"}
-    if frame_name not in allowed:
-        return {"error": "Кадр не найден"}
-    frame_path = os.path.join(storage.get_report_dir(report_id), "frames", frame_name)
-    if not os.path.exists(frame_path):
-        return {"error": "Кадр не найден"}
-    return FileResponse(frame_path, media_type="image/png")
-
-
-@app.get("/video-player/{report_id}")
-async def video_player(report_id: str, t: float = 0.0):
-    """HTML-плеер видео с автопереходом к таймкоду ошибки (?t=<секунды>)."""
-    doc = _get_report_or_none(report_id)
-    if doc is None:
-        return HTMLResponse("<h1>Отчёт не найден</h1>", status_code=404)
-    html = f"""<!DOCTYPE html>
-<html lang="ru">
-<head><meta charset="utf-8"><title>Видео тренировки</title></head>
-<body style="margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center">
-  <h2 style="padding:12px">Видео тренировки — переход к моменту ошибки</h2>
-  <video id="player" width="960" controls autoplay>
-    <source src="/reports/{report_id}/video" type="video/mp4">
-  </video>
-  <p><a href="/reports/{report_id}/pdf" style="color:#7ab7ff">Скачать PDF-карточку</a></p>
-  <script>
-    const player = document.getElementById("player");
-    player.currentTime = {float(t)};
-  </script>
-  </body>
-</html>"""
-    return HTMLResponse(html)
-
-
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """
@@ -834,104 +702,4 @@ async def health():
     return {
         "status": "ok" if POSE_MODEL_OK else "degraded",
         "pose_model_ok": POSE_MODEL_OK,
-    }
-
-
-# --- LLM-агент-ассистент тренера (MVP: GigaChat, бесплатный тариф) ---
-
-# Лимит AGENT_RATE_LIMIT_PER_MINUTE живёт в src/app/auth.py и читается там же
-# (патчить в тестах нужно src.app.auth). AGENT_MAX_HISTORY_MESSAGES остаётся
-# импортом из config.py — им пользуется логика диалога ниже.
-
-
-@app.post("/agent/chat/{report_id}", response_model=AgentChatResponse)
-async def agent_chat(
-    report_id: str,
-    request: Request,
-    _api_key: str = Depends(require_agent_access),
-):
-    """
-    Чат с LLM-агентом по отчёту о тренировке.
-
-    Тело запроса (JSON):
-      {"message": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}
-
-    Ответ: {"reply": "..."}.
-    Ошибки: 401/429 — auth/лимит; 404 — отчёт не найден; 400 — пустое сообщение
-    или некорректное тело; 503 — LLM не настроен; 502 — ошибка провайдера LLM.
-    """
-    # 1. Тело запроса. Валидация вручную через model_validate (а не параметром
-    # эндпоинта), чтобы на некорректное тело отвечать 400, как и раньше —
-    # стандартная FastAPI-валидация вернула бы 422.
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Некорректный JSON в теле запроса")
-
-    try:
-        payload = AgentChatRequest.model_validate(body)
-    except ValidationError:
-        raise HTTPException(status_code=400, detail="Некорректное тело запроса")
-
-    message = payload.message
-    history = payload.history or []
-
-    # Пустое (из одних пробелов) сообщение — прежняя ошибка 400;
-    # Pydantic-схема сама это не отсеивает.
-    if not message.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Поле message обязательно и не может быть пустым",
-        )
-
-    # 2. LLM должен быть настроен до обращения к хранилищу (fail fast)
-    try:
-        llm = get_llm_client()
-    except LLMNotConfiguredError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-
-    # 3. Контекст отчёта (детерминированные данные; отчёт не найден -> 404)
-    try:
-        context = build_report_context(report_id, reports_dir=storage.REPORTS_DIR)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-
-    # 4. Диалог: системный промпт + контекст + ограниченная история + сообщение
-    from agent.prompts import SYSTEM_PROMPT, format_context_as_json
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                "Данные отчёта (JSON):\n"
-                + format_context_as_json(context)
-                + "\n\nВопрос тренера: "
-                + message.strip()
-            ),
-        },
-    ]
-    # История: только последние AGENT_MAX_HISTORY_MESSAGES сообщений
-    for h in history[-AGENT_MAX_HISTORY_MESSAGES:]:
-        if h.content.strip():
-            messages.append({"role": h.role, "content": h.content.strip()})
-
-    # 5. Запрос к LLM (цикл function calling внутри ask(): модель может
-    #    запросить инструменты динамики — error_trend / previous_report)
-    try:
-        reply = llm.ask(messages)
-    except LLMRequestError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    return {"reply": reply, "report_id": report_id}
-
-
-@app.get("/agent/health", response_model=AgentHealthResponse)
-async def agent_health():
-    """Доступность LLM-агента: настроен ли провайдер и установлен ли SDK."""
-    from agent.llm_client import is_llm_configured
-
-    return {
-        "llm_configured": is_llm_configured(),
-        "provider": os.environ.get("LLM_PROVIDER", "gigachat").lower(),
     }
