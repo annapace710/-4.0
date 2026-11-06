@@ -1,0 +1,45 @@
+# Паспорт проекта (Шаг 8 рефакторинга).
+#
+# ВАЖНО: приложение — не устанавливаемая библиотека, а FastAPI-сервис,
+# запускаемый из исходников (`uvicorn main:app`). Поэтому [tool.setuptools]
+# не собирает пакеты проекта (packages = []), а зависимости продублированы
+# в requirements.txt (источник установки для Dockerfile и CI). При изменении
+# зависимостей обновляйте ОБА списка — см. перекрёстные ссылки в requirements*.txt.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rhythmic-gymnastics-assistant"
+version = "1.0.0"
+description = "Веб-приложение для анализа видео упражнений художественной гимнастики и выдачи рекомендаций по коррекции техники"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.0",
+    "opencv-python>=4.9.0",
+    "mediapipe>=0.10.0",
+    "numpy>=1.26.0",
+    "python-multipart>=0.0.9",
+    "reportlab>=4.0.0",
+    "gigachat>=0.1.0",
+]
+
+[project.optional-dependencies]
+# Зависимости для обучения собственной модели детекции булав
+# (train_club_detector.py): pip install .[train]
+train = [
+    "ultralytics>=8.0.0",
+    "onnx>=1.15.0",
+    "onnxruntime>=1.16.0",
+]
+
+[tool.setuptools]
+# Приложение запускается из исходников и не устанавливается как пакет:
+# список пакетов пуст, чтобы `pip install .` ставил только зависимости.
+packages = []
