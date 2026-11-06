@@ -1,3 +1,6 @@
+# Источник установки зависимостей для Dockerfile и CI (pip install -r requirements.txt).
+# Дублирует список из pyproject.toml (паспорт проекта, Шаг 8): при изменении
+# зависимостей обновляйте ОБА файла.
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.0
